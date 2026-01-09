@@ -33,7 +33,7 @@ class SparseBatch(ctypes.Structure):
         white_values = torch.from_numpy(np.ctypeslib.as_array(self.white_values, shape=(self.num_active_white_features,))).pin_memory().to(device=device, non_blocking=True)
         black_values = torch.from_numpy(np.ctypeslib.as_array(self.black_values, shape=(self.num_active_black_features,))).pin_memory().to(device=device, non_blocking=True)
         iw = torch.transpose(torch.from_numpy(np.ctypeslib.as_array(self.white, shape=(self.num_active_white_features, 2))).pin_memory().to(device=device, non_blocking=True), 0, 1).long()
-        ib = torch.transpose(torch.from_numpy(np.ctypeslib.as_array(self.black, shape=(self.num_active_white_features, 2))).pin_memory().to(device=device, non_blocking=True), 0, 1).long()
+        ib = torch.transpose(torch.from_numpy(np.ctypeslib.as_array(self.black, shape=(self.num_active_black_features, 2))).pin_memory().to(device=device, non_blocking=True), 0, 1).long()
         us = torch.from_numpy(np.ctypeslib.as_array(self.is_white, shape=(self.size, 1))).pin_memory().to(device=device, non_blocking=True)
         them = 1.0 - us
         outcome = torch.from_numpy(np.ctypeslib.as_array(self.outcome, shape=(self.size, 1))).pin_memory().to(device=device, non_blocking=True)
@@ -55,7 +55,7 @@ class TrainingDataProvider:
         destroy_stream,
         fetch_next,
         destroy_part,
-        filename,
+        filenames,
         cyclic,
         num_workers,
         batch_size=None,
@@ -68,7 +68,10 @@ class TrainingDataProvider:
         self.destroy_stream = destroy_stream
         self.fetch_next = fetch_next
         self.destroy_part = destroy_part
-        self.filename = filename.encode('utf-8')
+        # Support both single filename (string) and list of filenames
+        if isinstance(filenames, str):
+            filenames = [filenames]
+        self.filenames = filenames
         self.cyclic = cyclic
         self.num_workers = num_workers
         self.batch_size = batch_size
@@ -76,10 +79,15 @@ class TrainingDataProvider:
         self.random_fen_skipping = random_fen_skipping
         self.device = device
 
+        # Convert filenames to C array
+        filenames_encoded = [f.encode('utf-8') for f in self.filenames]
+        filenames_array = (ctypes.c_char_p * len(filenames_encoded))(*filenames_encoded)
+        num_files = len(filenames_encoded)
+
         if batch_size:
-            self.stream = self.create_stream(self.feature_set, self.num_workers, self.filename, batch_size, cyclic, filtered, random_fen_skipping)
+            self.stream = self.create_stream(self.feature_set, self.num_workers, num_files, filenames_array, batch_size, cyclic, filtered, random_fen_skipping)
         else:
-            self.stream = self.create_stream(self.feature_set, self.num_workers, self.filename, cyclic, filtered, random_fen_skipping)
+            self.stream = self.create_stream(self.feature_set, self.num_workers, num_files, filenames_array, cyclic, filtered, random_fen_skipping)
 
     def __iter__(self):
         return self
@@ -99,7 +107,7 @@ class TrainingDataProvider:
 
 create_sparse_batch_stream = dll.create_sparse_batch_stream
 create_sparse_batch_stream.restype = ctypes.c_void_p
-create_sparse_batch_stream.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_bool, ctypes.c_bool]
+create_sparse_batch_stream.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p), ctypes.c_int, ctypes.c_bool, ctypes.c_bool, ctypes.c_int]
 destroy_sparse_batch_stream = dll.destroy_sparse_batch_stream
 destroy_sparse_batch_stream.argtypes = [ctypes.c_void_p]
 
@@ -128,14 +136,14 @@ def make_sparse_batch_from_fens(feature_set, fens, scores, plies, results):
     return b
 
 class SparseBatchProvider(TrainingDataProvider):
-    def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu'):
+    def __init__(self, feature_set, filenames, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu'):
         super(SparseBatchProvider, self).__init__(
             feature_set,
             create_sparse_batch_stream,
             destroy_sparse_batch_stream,
             fetch_next_sparse_batch,
             destroy_sparse_batch,
-            filename,
+            filenames,
             cyclic,
             num_workers,
             batch_size,
@@ -144,10 +152,13 @@ class SparseBatchProvider(TrainingDataProvider):
             device)
 
 class SparseBatchDataset(torch.utils.data.IterableDataset):
-  def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu'):
+  def __init__(self, feature_set, filenames, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu'):
     super(SparseBatchDataset).__init__()
     self.feature_set = feature_set
-    self.filename = filename
+    # Support both single filename (string) and list of filenames
+    if isinstance(filenames, str):
+      filenames = [filenames]
+    self.filenames = filenames
     self.batch_size = batch_size
     self.cyclic = cyclic
     self.num_workers = num_workers
@@ -156,7 +167,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
     self.device = device
 
   def __iter__(self):
-    return SparseBatchProvider(self.feature_set, self.filename, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device)
+    return SparseBatchProvider(self.feature_set, self.filenames, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device)
 
 class FixedNumBatchesDataset(Dataset):
   def __init__(self, dataset, num_batches):

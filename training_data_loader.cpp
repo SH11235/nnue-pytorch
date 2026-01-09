@@ -247,18 +247,18 @@ struct HalfKA_hm {
 
     static int make_index(Square sq_k, Eval::BonaPiece p) {
         if (sq_k >= SQ_61) {
-            // ã Ç™6ãÿÅ`9ãÿÇ…Ç¢ÇÈèÍçáÅA4ãÿÅ`1ãÿÇ…îΩì]Ç∑ÇÈÅB
+            // ÔøΩ ÇÔøΩ6ÔøΩÿÅ`9ÔøΩÿÇ…ÇÔøΩÔøΩÔøΩÍçáÔøΩA4ÔøΩÿÅ`1ÔøΩÿÇ…îÔøΩÔøΩ]ÔøΩÔøΩÔøΩÔøΩB
             sq_k = Mir(sq_k);
 
             if (p >= Eval::BonaPiece::fe_hand_end) {
-                // éùãÓÇÕîΩì]ÇµÇ»Ç¢ÅB
+                // ÔøΩÔøΩÔøΩÔøΩÕîÔøΩÔøΩ]ÔøΩÔøΩÔøΩ»ÇÔøΩÔøΩB
                 int piece_index = (p - Eval::BonaPiece::fe_hand_end) / SQ_NB;
                 Square sq_p = static_cast<Square>((p - Eval::BonaPiece::fe_hand_end) % SQ_NB);
                 sq_p = Mir(sq_p);
                 p = static_cast<Eval::BonaPiece>(Eval::BonaPiece::fe_hand_end + piece_index * static_cast<int>(SQ_NB) + sq_p);
             }
         }
-        // å„éËã ÇÕé©ã Ç∆ìØÇ∂PLANEÇ…éùÇ¡ÇƒÇ¢Ç≠
+        // ÔøΩÔøΩÔøΩ ÇÕéÔøΩÔøΩ Ç∆ìÔøΩÔøΩÔøΩPLANEÔøΩ…éÔøΩÔøΩÔøΩÔøΩƒÇÔøΩÔøΩÔøΩ
         return static_cast<int>(Eval::BonaPiece::e_king) * static_cast<int>(sq_k) + static_cast<int>(p >= Eval::BonaPiece::e_king ? p - SQ_NB : p);
     }
 
@@ -395,8 +395,8 @@ struct Stream : AnyStream
 {
     using StorageType = StorageT;
 
-    Stream(int concurrency, const char* filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
-        m_stream(training_data::open_sfen_input_file_parallel(concurrency, filename, cyclic, skipPredicate))
+    Stream(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+        m_stream(training_data::open_sfen_input_file_parallel(concurrency, filenames, cyclic, skipPredicate))
     {
     }
 
@@ -411,8 +411,8 @@ struct AsyncStream : Stream<StorageT>
 {
     using BaseType = Stream<StorageT>;
 
-    AsyncStream(int concurrency, const char* filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
-        BaseType(1, filename, cyclic, skipPredicate)
+    AsyncStream(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+        BaseType(1, filenames, cyclic, skipPredicate)
     {
     }
 
@@ -438,13 +438,13 @@ struct FeaturedBatchStream : Stream<StorageT>
 
     static constexpr int num_feature_threads_per_reading_thread = 2;
 
-    FeaturedBatchStream(int concurrency, const char* filename, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+    FeaturedBatchStream(int concurrency, const std::vector<std::string>& filenames, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
         BaseType(
             std::max(
                 1,
                 concurrency / num_feature_threads_per_reading_thread
             ),
-            filename,
+            filenames,
             cyclic,
             skipPredicate
         ),
@@ -628,9 +628,12 @@ extern "C" {
         return nullptr;
     }
 
-    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(const char* feature_set_c, int concurrency, const char* filename, int batch_size, bool cyclic, bool filtered, int random_fen_skipping)
+    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(const char* feature_set_c, int concurrency, int num_files, const char* const* filenames, int batch_size, bool cyclic, bool filtered, int random_fen_skipping)
     {
         EnsureInitialize();
+
+        // Convert C-style array to vector
+        std::vector<std::string> filenames_vec(filenames, filenames + num_files);
 
         std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr;
         if (filtered || random_fen_skipping)
@@ -659,23 +662,23 @@ extern "C" {
         std::string_view feature_set(feature_set_c);
         if (feature_set == "HalfKP")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKP>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+            return new FeaturedBatchStream<FeatureSet<HalfKP>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
         }
         else if (feature_set == "HalfKP^")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKPFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+            return new FeaturedBatchStream<FeatureSet<HalfKPFactorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
         }
         else if (feature_set == "HalfKA_hm")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKA_hm>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+            return new FeaturedBatchStream<FeatureSet<HalfKA_hm>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
         }
         // else if (feature_set == "HalfKA")
         // {
-        //     return new FeaturedBatchStream<FeatureSet<HalfKA>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+        //     return new FeaturedBatchStream<FeatureSet<HalfKA>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
         // }
         // else if (feature_set == "HalfKA^")
         // {
-        //     return new FeaturedBatchStream<FeatureSet<HalfKAFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+        //     return new FeaturedBatchStream<FeatureSet<HalfKAFactorized>, SparseBatch>(concurrency, filenames_vec, batch_size, cyclic, skipPredicate);
         // }
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
@@ -703,7 +706,8 @@ extern "C" {
 
 int main()
 {
-    auto stream = create_sparse_batch_stream("HalfKA_hm", 4, R"(C:\shogi\training_data\training_data.suisho5.depth=9\kifu.tag=train.depth=9.num_positions=1000000000.start_time=1648946223.thread_index=000.bin)", 8192, true, false, 0);
+    const char* filenames[] = {R"(C:\shogi\training_data\training_data.suisho5.depth=9\kifu.tag=train.depth=9.num_positions=1000000000.start_time=1648946223.thread_index=000.bin)"};
+    auto stream = create_sparse_batch_stream("HalfKA_hm", 4, 1, filenames, 8192, true, false, 0);
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < 1000; ++i)
     {

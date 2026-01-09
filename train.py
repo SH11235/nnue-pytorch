@@ -12,13 +12,13 @@ from torch import set_num_threads as t_set_num_threads
 from pytorch_lightning import loggers as pl_loggers
 from torch.utils.data import DataLoader, Dataset
 
-def data_loader_cc(train_filename, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size):
+def data_loader_cc(train_filenames, val_filenames, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size):
   # Epoch and validation sizes are arbitrary
   val_size = 1000000
   features_name = feature_set.name
-  train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filename, batch_size, num_workers=num_workers,
+  train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filenames, batch_size, num_workers=num_workers,
                                                    filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device)
-  val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, batch_size, filtered=filtered,
+  val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filenames, batch_size, filtered=filtered,
                                                    random_fen_skipping=random_fen_skipping, device=main_device)
   # num_workers has to be 0 for sparse, and 1 for dense
   # it currently cannot work in parallel mode but it shouldn't need to
@@ -40,20 +40,24 @@ class NetworkSaveCheckpoint(pytorch_lightning.callbacks.Checkpoint):
   ):
     self.every_n_epochs = every_n_epochs
     self.log_dir = log_dir
-  
+
   def on_validation_end(self, trainer: 'pl.Trainer', pl_module: 'pl.LightningModule') -> None:
     if trainer.current_epoch == 0 or trainer.current_epoch % self.every_n_epochs != 0:
       return
-    
+
     ckpt_file_path = os.path.join(self.log_dir, f'{trainer.current_epoch}.ckpt')
     trainer.save_checkpoint(ckpt_file_path)
 
 
 def main():
   parser = argparse.ArgumentParser(description="Trains the network.")
-  parser.add_argument("train", help="Training data (.bin or .binpack)")
-  parser.add_argument("val", help="Validation data (.bin or .binpack)")
-  parser = pl.Trainer.add_argparse_args(parser)
+  parser.add_argument("train", help="Training data (.bin). Multiple files can be specified with comma-separated paths (e.g., 'file1.bin,file2.bin')")
+  parser.add_argument("val", help="Validation data (.bin). Multiple files can be specified with comma-separated paths")
+  # Lightning 2.x: Trainer args are added manually instead of add_argparse_args
+  parser.add_argument("--accelerator", default="auto", help="Accelerator to use (auto, cpu, gpu, etc.)")
+  parser.add_argument("--devices", default="auto", help="Number of devices to use")
+  parser.add_argument("--max-epochs", default=-1, type=int, dest='max_epochs', help="Maximum number of epochs")
+  parser.add_argument("--default-root-dir", default=None, dest='default_root_dir', help="Default root directory for logs")
   parser.add_argument("--py-data", action="store_true", help="Use python data loader (default=False)")
   parser.add_argument("--lambda", default=[1.0], nargs='+', type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
   parser.add_argument("--lr", default=[1.0], nargs='+', type=float, dest='lr', help="Initial learning rate.")
@@ -78,10 +82,17 @@ def main():
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
-  if not os.path.exists(args.train):
-    raise Exception('{0} does not exist'.format(args.train))
-  if not os.path.exists(args.val):
-    raise Exception('{0} does not exist'.format(args.val))
+  # Parse comma-separated file lists
+  train_files = [f.strip() for f in args.train.split(',')]
+  val_files = [f.strip() for f in args.val.split(',')]
+
+  # Check all files exist
+  for f in train_files:
+    if not os.path.exists(f):
+      raise Exception('{0} does not exist'.format(f))
+  for f in val_files:
+    if not os.path.exists(f):
+      raise Exception('{0} does not exist'.format(f))
 
   feature_set = features.get_feature_set_from_name(args.features)
 
@@ -115,14 +126,16 @@ def main():
   print("Num virtual features: {}".format(feature_set.num_virtual_features))
   print("Num features: {}".format(feature_set.num_features))
 
-  print("Training with {} validating with {}".format(args.train, args.val))
+  print("Training with {} validating with {}".format(train_files, val_files))
 
   pl.seed_everything(args.seed)
   print("Seed {}".format(args.seed))
 
   batch_size = args.batch_size
   if batch_size <= 0:
-    batch_size = 128 if args.gpus == 0 else 8192
+    # Lightning 2.x: use accelerator instead of gpus
+    use_gpu = args.accelerator in ("gpu", "cuda", "auto") and torch.cuda.is_available()
+    batch_size = 8192 if use_gpu else 128
   print('Using batch size {}'.format(batch_size))
 
   print('Smart fen skipping: {}'.format(args.smart_fen_skipping))
@@ -137,16 +150,26 @@ def main():
 
   tb_logger = pl_loggers.TensorBoardLogger(logdir)
   checkpoint_callback = NetworkSaveCheckpoint(every_n_epochs=args.network_save_period, log_dir=tb_logger.log_dir)
-  trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
+  # Lightning 2.x: use Trainer() directly instead of from_argparse_args
+  trainer = pl.Trainer(
+    accelerator=args.accelerator,
+    devices=args.devices,
+    max_epochs=args.max_epochs if args.max_epochs > 0 else None,
+    default_root_dir=args.default_root_dir,
+    callbacks=[checkpoint_callback],
+    logger=tb_logger,
+    num_sanity_val_steps=0,  # Skip sanity check to avoid issues
+  )
 
   main_device = 'cuda:0'
 
   if args.py_data:
     print('Using python data loader')
-    train, val = data_loader_py(args.train, args.val, feature_set, batch_size, main_device)
+    # Python data loader only supports single file
+    train, val = data_loader_py(train_files[0], val_files[0], feature_set, batch_size, main_device)
   else:
     print('Using c++ data loader')
-    train, val = data_loader_cc(args.train, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size)
+    train, val = data_loader_cc(train_files, val_files, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size)
 
   trainer.fit(nnue, train, val)
 

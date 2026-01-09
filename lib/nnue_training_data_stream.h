@@ -8,8 +8,15 @@
 #include <fstream>
 #include <string>
 #include <memory>
+#include <vector>
+#include <functional>
 
+#ifdef _WIN32
 #include <ppl.h>
+#else
+#include <algorithm>
+#include <execution>
+#endif
 
 namespace training_data {
 
@@ -115,10 +122,17 @@ namespace training_data {
                 if (m_stream.read(reinterpret_cast<char*>(&packedSfenValues[0]), sizeof(Learner::PackedSfenValue) * n))
                 {
                     vec.resize(n);
+#ifdef _WIN32
                     concurrency::parallel_for(size_t(0), n, [&vec, &packedSfenValues](size_t i)
                         {
                             vec[i] = packedSfenValueToTrainingDataEntry(packedSfenValues[i]);
                         });
+#else
+                    for (size_t i = 0; i < n; ++i)
+                    {
+                        vec[i] = packedSfenValueToTrainingDataEntry(packedSfenValues[i]);
+                    }
+#endif
                     return;
                 }
                 else
@@ -165,11 +179,165 @@ namespace training_data {
         return nullptr;
     }
 
-    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file_parallel(int concurrency, const std::string& filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr)
+    struct BinSfenMultiFileInputStream : BasicSfenInputStream
     {
+        static constexpr auto openmode = std::ios::in | std::ios::binary;
+        static inline const std::string extension = "bin";
+
+        BinSfenMultiFileInputStream(const std::vector<std::string>& filenames, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+            m_filenames(filenames),
+            m_currentFileIndex(0),
+            m_eof(false),
+            m_cyclic(cyclic),
+            m_skipPredicate(std::move(skipPredicate))
+        {
+            if (!m_filenames.empty())
+            {
+                m_stream = std::fstream(m_filenames[0], openmode);
+                m_eof = !m_stream;
+            }
+            else
+            {
+                m_eof = true;
+            }
+        }
+
+        std::optional<TrainingDataEntry> next() override
+        {
+            Learner::PackedSfenValue e;
+            bool cycledOnce = false;
+
+            for(;;)
+            {
+                if(m_stream.read(reinterpret_cast<char*>(&e), sizeof(Learner::PackedSfenValue)))
+                {
+                    auto entry = packedSfenValueToTrainingDataEntry(e);
+                    if (!m_skipPredicate || !m_skipPredicate(entry))
+                        return entry;
+                }
+                else
+                {
+                    // Current file exhausted, try next file
+                    m_currentFileIndex++;
+                    if (m_currentFileIndex >= m_filenames.size())
+                    {
+                        if (m_cyclic)
+                        {
+                            if (cycledOnce)
+                            {
+                                m_eof = true;
+                                return std::nullopt;
+                            }
+                            m_currentFileIndex = 0;
+                            cycledOnce = true;
+                        }
+                        else
+                        {
+                            m_eof = true;
+                            return std::nullopt;
+                        }
+                    }
+
+                    m_stream = std::fstream(m_filenames[m_currentFileIndex], openmode);
+                    if (!m_stream)
+                    {
+                        m_eof = true;
+                        return std::nullopt;
+                    }
+                }
+            }
+        }
+
+        void fill(std::vector<TrainingDataEntry>& vec, std::size_t n) override
+        {
+            std::vector<Learner::PackedSfenValue> packedSfenValues(n);
+            size_t totalRead = 0;
+            bool cycledOnce = false;
+
+            while (totalRead < n)
+            {
+                size_t remaining = n - totalRead;
+                if (m_stream.read(reinterpret_cast<char*>(&packedSfenValues[totalRead]), sizeof(Learner::PackedSfenValue) * remaining))
+                {
+                    totalRead += remaining;
+                }
+                else
+                {
+                    // Read partial data if any
+                    size_t partialRead = m_stream.gcount() / sizeof(Learner::PackedSfenValue);
+                    totalRead += partialRead;
+
+                    // Move to next file
+                    m_currentFileIndex++;
+                    if (m_currentFileIndex >= m_filenames.size())
+                    {
+                        if (m_cyclic)
+                        {
+                            if (cycledOnce)
+                            {
+                                break;
+                            }
+                            m_currentFileIndex = 0;
+                            cycledOnce = true;
+                        }
+                        else
+                        {
+                            m_eof = true;
+                            break;
+                        }
+                    }
+
+                    m_stream = std::fstream(m_filenames[m_currentFileIndex], openmode);
+                    if (!m_stream)
+                    {
+                        m_eof = true;
+                        break;
+                    }
+                }
+            }
+
+            vec.resize(totalRead);
+            for (size_t i = 0; i < totalRead; ++i)
+            {
+                vec[i] = packedSfenValueToTrainingDataEntry(packedSfenValues[i]);
+            }
+        }
+
+        bool eof() const override
+        {
+            return m_eof;
+        }
+
+        ~BinSfenMultiFileInputStream() override {}
+
+    private:
+        std::vector<std::string> m_filenames;
+        size_t m_currentFileIndex;
+        std::fstream m_stream;
+        bool m_eof;
+        bool m_cyclic;
+        std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
+    };
+
+    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file_parallel(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr)
+    {
+        if (filenames.empty())
+            return nullptr;
+
         // TODO (low priority): optimize and parallelize .bin reading.
-        if (has_extension(filename, BinSfenInputStream::extension))
-            return std::make_unique<BinSfenInputStream>(filename, cyclic, std::move(skipPredicate));
+        if (has_extension(filenames[0], BinSfenInputStream::extension))
+        {
+            if (filenames.size() == 1)
+            {
+                // Single file: use original implementation
+                return std::make_unique<BinSfenInputStream>(filenames[0], cyclic, std::move(skipPredicate));
+            }
+            else
+            {
+                // Multiple files: use multi-file implementation
+                return std::make_unique<BinSfenMultiFileInputStream>(filenames, cyclic, std::move(skipPredicate));
+            }
+        }
 
         return nullptr;
     }
