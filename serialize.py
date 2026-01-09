@@ -70,9 +70,15 @@ class NNUEWriter():
   def write_header(self, model, fc_hash):
     self.int32(VERSION) # version
     self.int32(fc_hash ^ model.feature_set.hash ^ (M.L1*2)) # halfkp network hash
-    description = b"Features=HalfKP(Friend)[125388->256x2],"
-    description += b"Network=AffineTransform[1<-256](ClippedReLU[256](AffineTransform[256<-256]"
-    description += b"(ClippedReLU[256](AffineTransform[256<-512](InputSlice[512(0:512)])))))"
+    # Generate architecture description dynamically
+    num_features = model.feature_set.num_real_features
+    l1 = M.L1
+    l2 = M.L2
+    l3 = M.L3
+    feature_name = model.feature_set.name
+    description = f"Features={feature_name}[{num_features}->{l1}x2],".encode()
+    description += f"Network=AffineTransform[1<-{l3}](ClippedReLU[{l3}](AffineTransform[{l3}<-{l2}]".encode()
+    description += f"(ClippedReLU[{l2}](AffineTransform[{l2}<-{l1*2}](InputSlice[{l1*2}(0:{l1*2})])))))".encode()
     self.int32(len(description)) # Network definition
     self.buf.extend(description)
 
@@ -243,7 +249,7 @@ def main():
     if args.source.endswith(".pt"):
       nnue = torch.load(args.source)
     else:
-      nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set)
+      nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set, map_location=torch.device('cpu'))
     nnue.eval()
     writer = NNUEWriter(nnue, os.path.dirname(args.target))
     with open(args.target, 'wb') as f:

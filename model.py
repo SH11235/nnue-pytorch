@@ -1,4 +1,3 @@
-import chess
 import ranger
 import torch
 from torch import nn
@@ -8,7 +7,7 @@ import sys
 import math
 
 # 3 layer fully connected network
-L1 = 1024
+L1 = 512  # Changed from 1024 to 512 for better NPS/accuracy balance
 L2 = 8
 L3 = 96
 
@@ -157,12 +156,16 @@ class NNUE(pl.LightningModule):
   def validation_step(self, batch, batch_idx):
     return self.step_(batch, batch_idx, 'val_loss')
   
-  def validation_epoch_end(self, outputs):
-    self.latest_loss_sum += float(sum(outputs)) / len(outputs);
-    self.latest_loss_count += 1
+  def on_validation_epoch_end(self):
+    # Lightning 2.x: use on_validation_epoch_end without outputs parameter
+    # Collect loss from logged metrics
+    val_loss = self.trainer.callback_metrics.get('val_loss')
+    if val_loss is not None:
+      self.latest_loss_sum += float(val_loss)
+      self.latest_loss_count += 1
 
     if self.newbob_decay != 1.0 and self.current_epoch > 0 and self.current_epoch % self.num_epochs_to_adjust_lr == 0:
-      latest_loss = self.latest_loss_sum / self.latest_loss_count
+      latest_loss = self.latest_loss_sum / self.latest_loss_count if self.latest_loss_count > 0 else 1e10
       self.latest_loss_sum = 0.0
       self.latest_loss_count = 0
       if latest_loss < self.best_loss:
@@ -173,7 +176,7 @@ class NNUE(pl.LightningModule):
         self.newbob_scale *= self.newbob_decay
         self.print(f"{self.current_epoch=}, {latest_loss=} >= {self.best_loss=}, rejected, {self.newbob_scale=}")
         sys.stdout.flush()
-    
+
     if self.newbob_scale < self.min_newbob_scale:
       self.parameter_index += 1
       if self.parameter_index < len(self.lr):
@@ -186,18 +189,8 @@ class NNUE(pl.LightningModule):
   def test_step(self, batch, batch_idx):
     self.step_(batch, batch_idx, 'test_loss')
 
-  # learning rate warm-up
-  def optimizer_step(
-      self,
-      epoch,
-      batch_idx,
-      optimizer,
-      optimizer_idx,
-      optimizer_closure,
-      on_tpu,
-      using_native_amp,
-      using_lbfgs,
-  ):
+  # learning rate warm-up (Lightning 2.x compatible)
+  def on_before_optimizer_step(self, optimizer):
     # manually warm up lr without a scheduler
     if self.trainer.global_step - self.warmup_start_global_step < self.num_batches_warmup:
       warmup_scale = min(1.0, float(self.trainer.global_step - self.warmup_start_global_step + 1) / self.num_batches_warmup)
@@ -207,10 +200,9 @@ class NNUE(pl.LightningModule):
       pg["lr"] = self.lr[self.parameter_index] * warmup_scale * self.newbob_scale
       self.log("lr", pg["lr"])
 
-    # update params
-    optimizer.step(closure=optimizer_closure)
-
-    # clip parameters
+  # weight clipping after optimizer step (Lightning 2.x compatible)
+  def on_train_batch_end(self, outputs, batch, batch_idx):
+    # clip parameters after weight update
     for child in self.children():
       if not isinstance(child, nn.Linear):
         continue
