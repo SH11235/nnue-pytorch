@@ -3,9 +3,54 @@ __pycache__/
 .vscode/
 *.bak
 *.user
-/libtraining_data_loader.dll
-build/
-env/
-logs/
-venv/
 x64/
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Build directories
+build/
+build-*/
+build_*/
+
+# Shared libraries
+*.so
+*.dll
+*.dylib
+
+# Training data
+*.bin
+hao_depth9/
+suisho_*/
+
+# Model outputs
+*.nnue
+*.ckpt
+model/
+logs/
+logs_*/
+
+# Log files
+*.log
+
+# Images
+*.png
+
+# Book data
+book/
+
+# YaneuraOu build artifacts
+YaneuraOu/source/YaneuraOu-by-gcc
+YaneuraOu/source/eval/
+
+# Reference repositories
+nnue-pytorch-upstream/
+
+# Task/docs (local only)
+MULTIPLE_FILES_TASK.md
+docs/
+
+# Test data
+test_data.pack
