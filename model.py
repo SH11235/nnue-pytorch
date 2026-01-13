@@ -6,10 +6,38 @@ import pytorch_lightning as pl
 import sys
 import math
 
-# 3 layer fully connected network
-L1 = 512  # Changed from 1024 to 512 for better NPS/accuracy balance
-L2 = 8
-L3 = 96
+# アーキテクチャプリセット定義
+# 形式: (L1, L2, L3)
+# 命名規則: halfkp_{L1}x2-{L2}-{L3}
+ARCH_PRESETS = {
+    'halfkp_256x2-32-32': (256, 32, 32),   # やねうら王標準NNUE（水匠5、Háo等）
+    'halfkp_1024x2-8-32': (1024, 8, 32),   # tanuki- Lí (WCSC33)
+    'halfkp_512x2-8-96': (512, 8, 96),     # カスタム設定
+}
+
+# デフォルトアーキテクチャ
+DEFAULT_ARCH = 'halfkp_256x2-32-32'
+
+def get_arch_sizes(arch_name=None, l1=None, l2=None, l3=None):
+    """
+    アーキテクチャサイズを取得する。
+    個別指定（l1, l2, l3）がある場合はそちらを優先。
+    """
+    if arch_name and arch_name in ARCH_PRESETS:
+        base_l1, base_l2, base_l3 = ARCH_PRESETS[arch_name]
+    else:
+        base_l1, base_l2, base_l3 = ARCH_PRESETS[DEFAULT_ARCH]
+
+    # 個別指定で上書き
+    final_l1 = l1 if l1 is not None else base_l1
+    final_l2 = l2 if l2 is not None else base_l2
+    final_l3 = l3 if l3 is not None else base_l3
+
+    return final_l1, final_l2, final_l3
+
+def list_arch_presets():
+    """利用可能なプリセット一覧を返す"""
+    return list(ARCH_PRESETS.keys())
 
 class NNUE(pl.LightningModule):
   """
@@ -24,13 +52,20 @@ class NNUE(pl.LightningModule):
       self, feature_set, lambda_=[1.0], lr=[1.0],
       label_smoothing_eps=0.0, num_batches_warmup=10000, newbob_decay=0.5,
       num_epochs_to_adjust_lr=500, score_scaling=361, min_newbob_scale=1e-5,
-      momentum=0.0, ply_begin_threshold=100.0, ply_end_threshold=120.0):
+      momentum=0.0, ply_begin_threshold=100.0, ply_end_threshold=120.0,
+      arch=None, l1_size=None, l2_size=None, l3_size=None,
+      lr_milestones=None, lr_gamma=0.2):
     super(NNUE, self).__init__()
-    self.input = nn.Linear(feature_set.num_features, L1)
+
+    # アーキテクチャサイズを決定
+    self.L1, self.L2, self.L3 = get_arch_sizes(arch, l1_size, l2_size, l3_size)
+    self.arch_name = arch or DEFAULT_ARCH
+
+    self.input = nn.Linear(feature_set.num_features, self.L1)
     self.feature_set = feature_set
-    self.l1 = nn.Linear(2 * L1, L2)
-    self.l2 = nn.Linear(L2, L3)
-    self.output = nn.Linear(L3, 1)
+    self.l1 = nn.Linear(2 * self.L1, self.L2)
+    self.l2 = nn.Linear(self.L2, self.L3)
+    self.output = nn.Linear(self.L3, 1)
     self.lambda_ = lambda_
     self.lr = lr
     self.label_smoothing_eps = label_smoothing_eps
@@ -49,6 +84,9 @@ class NNUE(pl.LightningModule):
     self.momentum = momentum
     self.ply_begin_threshold = ply_begin_threshold
     self.ply_end_threshold = ply_end_threshold
+    # LR schedule (MultiStepLR)
+    self.lr_milestones = lr_milestones if lr_milestones is not None else []
+    self.lr_gamma = lr_gamma
 
     self._zero_virtual_feature_weights()
 
@@ -191,6 +229,24 @@ class NNUE(pl.LightningModule):
 
   # learning rate warm-up (Lightning 2.x compatible)
   def on_before_optimizer_step(self, optimizer):
+    # MultiStepLRを使用している場合もwarmupを適用
+    if self.lr_milestones:
+      warmup_scale = 1.0
+      if self.trainer.global_step - self.warmup_start_global_step < self.num_batches_warmup:
+        warmup_scale = min(1.0, float(self.trainer.global_step - self.warmup_start_global_step + 1) / self.num_batches_warmup)
+
+      # スケジューラが設定したLRにwarmup係数を掛ける
+      scheduler = self.lr_schedulers()
+      if scheduler is not None:
+        scheduled_lr = scheduler.get_last_lr()[0]
+      else:
+        scheduled_lr = self.lr[0]
+
+      for pg in optimizer.param_groups:
+        pg["lr"] = scheduled_lr * warmup_scale
+        self.log("lr", pg["lr"])
+      return
+
     # manually warm up lr without a scheduler
     if self.trainer.global_step - self.warmup_start_global_step < self.num_batches_warmup:
       warmup_scale = min(1.0, float(self.trainer.global_step - self.warmup_start_global_step + 1) / self.num_batches_warmup)
@@ -222,7 +278,26 @@ class NNUE(pl.LightningModule):
       child.weight.data.clamp_(-kMaxWeight, kMaxWeight)
 
   def configure_optimizers(self):
-    return torch.optim.SGD(self.parameters(), lr=self.lr[0], momentum=self.momentum)
+    # v12: v10設定に回帰（一律weight_decay=1e-4）
+    # v11のparam group分離はデータ問題（move16非合法）と切り分けるため一旦戻す
+    optimizer = torch.optim.SGD(
+        self.parameters(),
+        lr=self.lr[0],
+        momentum=self.momentum,
+        weight_decay=1e-4
+    )
+
+    # LR schedule: MultiStepLRを使用（lr_milestonesが指定されている場合）
+    if self.lr_milestones:
+      scheduler = torch.optim.lr_scheduler.MultiStepLR(
+          optimizer,
+          milestones=self.lr_milestones,
+          gamma=self.lr_gamma
+      )
+      print(f"Using MultiStepLR: milestones={self.lr_milestones}, gamma={self.lr_gamma}")
+      return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+
+    return optimizer
 
   def get_layers(self, filt):
     """

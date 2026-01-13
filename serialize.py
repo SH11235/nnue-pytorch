@@ -41,7 +41,7 @@ class NNUEWriter():
 
     fc_hash = self.fc_hash(model)
     self.write_header(model, fc_hash)
-    self.int32(model.feature_set.hash ^ (M.L1*2)) # Feature transformer hash
+    self.int32(model.feature_set.hash ^ (model.L1*2)) # Feature transformer hash
     self.write_feature_transformer(model)
     self.int32(fc_hash) # FC layers hash
     self.write_fc_layer(model.l1)
@@ -52,7 +52,7 @@ class NNUEWriter():
   def fc_hash(model):
     # InputSlice hash
     prev_hash = 0xEC42E90D
-    prev_hash ^= (M.L1 * 2)
+    prev_hash ^= (model.L1 * 2)
 
     # Fully connected layers
     layers = [model.l1, model.l2, model.output]
@@ -69,12 +69,12 @@ class NNUEWriter():
 
   def write_header(self, model, fc_hash):
     self.int32(VERSION) # version
-    self.int32(fc_hash ^ model.feature_set.hash ^ (M.L1*2)) # halfkp network hash
+    self.int32(fc_hash ^ model.feature_set.hash ^ (model.L1*2)) # halfkp network hash
     # Generate architecture description dynamically
     num_features = model.feature_set.num_real_features
-    l1 = M.L1
-    l2 = M.L2
-    l3 = M.L3
+    l1 = model.L1
+    l2 = model.L2
+    l3 = model.L3
     feature_name = model.feature_set.name
     description = f"Features={feature_name}[{num_features}->{l1}x2],".encode()
     description += f"Network=AffineTransform[1<-{l3}](ClippedReLU[{l3}](AffineTransform[{l3}<-{l2}]".encode()
@@ -181,7 +181,7 @@ class NNUEReader():
     fc_hash = NNUEWriter.fc_hash(self.model)
 
     self.read_header(feature_set, fc_hash)
-    self.read_int32(feature_set.hash ^ (M.L1*2)) # Feature transformer hash
+    self.read_int32(feature_set.hash ^ (self.model.L1*2)) # Feature transformer hash
     self.read_feature_transformer(self.model.input)
     self.read_int32(fc_hash) # FC layers hash
     self.read_fc_layer(self.model.l1)
@@ -190,7 +190,7 @@ class NNUEReader():
 
   def read_header(self, feature_set, fc_hash):
     self.read_int32(VERSION) # version
-    self.read_int32(fc_hash ^ feature_set.hash ^ (M.L1*2)) # halfkp network hash
+    self.read_int32(fc_hash ^ feature_set.hash ^ (self.model.L1*2)) # halfkp network hash
     desc_len = self.read_int32() # Network definition
     description = self.f.read(desc_len)
 
@@ -236,6 +236,8 @@ def main():
   parser = argparse.ArgumentParser(description="Converts files between ckpt and nnue format.")
   parser.add_argument("source", help="Source file (can be .ckpt, .pt or .nnue)")
   parser.add_argument("target", help="Target file (can be .pt or .nnue)")
+  parser.add_argument("--arch", default=None, choices=M.list_arch_presets(),
+                      help=f"Architecture preset. Available: {', '.join(M.list_arch_presets())}")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -249,7 +251,7 @@ def main():
     if args.source.endswith(".pt"):
       nnue = torch.load(args.source)
     else:
-      nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set, map_location=torch.device('cpu'))
+      nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set, arch=args.arch, map_location=torch.device('cpu'))
     nnue.eval()
     writer = NNUEWriter(nnue, os.path.dirname(args.target))
     with open(args.target, 'wb') as f:

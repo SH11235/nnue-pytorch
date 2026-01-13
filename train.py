@@ -49,6 +49,44 @@ class NetworkSaveCheckpoint(pytorch_lightning.callbacks.Checkpoint):
     trainer.save_checkpoint(ckpt_file_path)
 
 
+class FeatureCollapseCallback(pytorch_lightning.callbacks.Callback):
+  """Feature Collapseを検出して学習を停止するコールバック"""
+
+  def __init__(self, min_active_rate: float = 0.5, check_every_n_epochs: int = 10):
+    self.min_active_rate = min_active_rate  # 最小活性化率（デフォルト50%）
+    self.check_every_n_epochs = check_every_n_epochs
+    self.best_active_rate = 0.0
+    self.best_epoch = 0
+
+  def on_validation_end(self, trainer: 'pl.Trainer', pl_module: 'pl.LightningModule') -> None:
+    if trainer.current_epoch == 0:
+      return
+    if trainer.current_epoch % self.check_every_n_epochs != 0:
+      return
+
+    # input.biasを取得
+    bias = pl_module.input.bias.detach().cpu().numpy()
+
+    # 活性化率を計算（bias > -1/127 の割合）
+    threshold = -1.0 / 127.0
+    active_rate = (bias > threshold).sum() / len(bias)
+
+    # ベスト記録を更新
+    if active_rate > self.best_active_rate:
+      self.best_active_rate = active_rate
+      self.best_epoch = trainer.current_epoch
+
+    print(f"\n[Feature Collapse Check] Epoch {trainer.current_epoch}")
+    print(f"  Bias Mean: {bias.mean():.4f}, Range: [{bias.min():.4f}, {bias.max():.4f}]")
+    print(f"  Active Rate: {active_rate*100:.1f}% (threshold: {self.min_active_rate*100:.0f}%)")
+    print(f"  Best: {self.best_active_rate*100:.1f}% at epoch {self.best_epoch}")
+
+    if active_rate < self.min_active_rate:
+      print(f"\n⚠️ Feature Collapse検出! 活性化率 {active_rate*100:.1f}% < {self.min_active_rate*100:.0f}%")
+      print(f"学習を停止します。Best checkpointはepoch {self.best_epoch}です。")
+      trainer.should_stop = True
+
+
 def main():
   parser = argparse.ArgumentParser(description="Trains the network.")
   parser.add_argument("train", help="Training data (.bin). Multiple files can be specified with comma-separated paths (e.g., 'file1.bin,file2.bin')")
@@ -77,8 +115,23 @@ def main():
   parser.add_argument("--score-scaling", default=361, type=float, dest='score_scaling', help="Score scaling.")
   parser.add_argument("--min-newbob-scale", default=1e-5, type=float, dest='min_newbob_scale', help="Minimum learning rate to stop the training.")
   parser.add_argument("--momentum", default=0.0, type=float, dest='momentum', help="Momentum.")
+  parser.add_argument("--lr-milestones", default=[], nargs='*', type=int, dest='lr_milestones', help="Epochs at which to decay LR (e.g., --lr-milestones 15 25).")
+  parser.add_argument("--lr-gamma", default=0.2, type=float, dest='lr_gamma', help="LR decay factor at each milestone (default: 0.2).")
   parser.add_argument("--ply-begin-threshold", default=100.0, type=float, dest='ply_begin_threshold', help="Ply at which lambda begins to decay.")
   parser.add_argument("--ply-end-threshold", default=120.0, type=float, dest='ply_end_threshold', help="Ply at which lambda ends to decay.")
+  parser.add_argument("--min-active-rate", default=0.5, type=float, dest='min_active_rate', help="Minimum active neuron rate before stopping (Feature Collapse detection). Set to 0 to disable.")
+
+  # アーキテクチャ設定
+  arch_choices = M.list_arch_presets()
+  parser.add_argument("--arch", default=None, choices=arch_choices, dest='arch',
+                      help=f"Architecture preset. Available: {', '.join(arch_choices)}. Default: {M.DEFAULT_ARCH}")
+  parser.add_argument("--l1", default=None, type=int, dest='l1_size',
+                      help="L1 layer size (Feature Transformer output). Overrides --arch if specified.")
+  parser.add_argument("--l2", default=None, type=int, dest='l2_size',
+                      help="L2 layer size. Overrides --arch if specified.")
+  parser.add_argument("--l3", default=None, type=int, dest='l3_size',
+                      help="L3 layer size. Overrides --arch if specified.")
+
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -96,6 +149,11 @@ def main():
 
   feature_set = features.get_feature_set_from_name(args.features)
 
+  # アーキテクチャサイズを決定・表示
+  arch_l1, arch_l2, arch_l3 = M.get_arch_sizes(args.arch, args.l1_size, args.l2_size, args.l3_size)
+  arch_name = args.arch or M.DEFAULT_ARCH
+  print(f"Architecture: {arch_name} (L1={arch_l1}, L2={arch_l2}, L3={arch_l3})")
+
   if not args.resume_from_model:
     nnue = M.NNUE(
       feature_set=feature_set, lambda_=args.lambda_,
@@ -105,9 +163,40 @@ def main():
       num_epochs_to_adjust_lr=args.num_epochs_to_adjust_lr,
       score_scaling=args.score_scaling,
       min_newbob_scale=args.min_newbob_scale, momentum=args.momentum,
-      ply_begin_threshold=args.ply_begin_threshold, ply_end_threshold=args.ply_end_threshold)
+      ply_begin_threshold=args.ply_begin_threshold, ply_end_threshold=args.ply_end_threshold,
+      arch=args.arch, l1_size=args.l1_size, l2_size=args.l2_size, l3_size=args.l3_size,
+      lr_milestones=args.lr_milestones, lr_gamma=args.lr_gamma)
   else:
-    nnue = M.NNUE.load_from_checkpoint(args.resume_from_model, feature_set=feature_set)
+    # モデルファイルの形式を判定
+    checkpoint = torch.load(args.resume_from_model, map_location='cpu')
+    is_lightning_ckpt = 'pytorch-lightning_version' in checkpoint
+    is_converted_model = 'state_dict' in checkpoint and 'architecture' in checkpoint
+
+    if is_lightning_ckpt:
+      # PyTorch Lightningチェックポイント形式
+      print(f'Loading Lightning checkpoint: {args.resume_from_model}')
+      nnue = M.NNUE.load_from_checkpoint(
+        args.resume_from_model, feature_set=feature_set,
+        arch=args.arch, l1_size=args.l1_size, l2_size=args.l2_size, l3_size=args.l3_size)
+    elif is_converted_model:
+      # 変換済みモデル形式（state_dict + architecture）
+      print(f'Loading converted model: {args.resume_from_model}')
+      print(f'  Original architecture: {checkpoint.get("architecture", "unknown")}')
+      nnue = M.NNUE(
+        feature_set=feature_set, lambda_=args.lambda_,
+        lr=args.lr, label_smoothing_eps=args.label_smoothing_eps,
+        num_batches_warmup=args.num_batches_warmup,
+        newbob_decay=args.newbob_decay,
+        num_epochs_to_adjust_lr=args.num_epochs_to_adjust_lr,
+        score_scaling=args.score_scaling,
+        min_newbob_scale=args.min_newbob_scale, momentum=args.momentum,
+        ply_begin_threshold=args.ply_begin_threshold, ply_end_threshold=args.ply_end_threshold,
+        arch=args.arch, l1_size=args.l1_size, l2_size=args.l2_size, l3_size=args.l3_size,
+        lr_milestones=args.lr_milestones, lr_gamma=args.lr_gamma)
+      nnue.load_state_dict(checkpoint['state_dict'])
+    else:
+      raise ValueError(f'Unknown checkpoint format: {args.resume_from_model}')
+
     nnue.set_feature_set(feature_set)
     nnue.lambda_ = args.lambda_
     # we can set the following here just like that because when resuming
@@ -150,13 +239,24 @@ def main():
 
   tb_logger = pl_loggers.TensorBoardLogger(logdir)
   checkpoint_callback = NetworkSaveCheckpoint(every_n_epochs=args.network_save_period, log_dir=tb_logger.log_dir)
+
+  # コールバックリストを構築
+  callbacks = [checkpoint_callback]
+  if args.min_active_rate > 0:
+    collapse_callback = FeatureCollapseCallback(
+      min_active_rate=args.min_active_rate,
+      check_every_n_epochs=args.network_save_period
+    )
+    callbacks.append(collapse_callback)
+    print(f'Feature Collapse detection enabled: min_active_rate={args.min_active_rate*100:.0f}%')
+
   # Lightning 2.x: use Trainer() directly instead of from_argparse_args
   trainer = pl.Trainer(
     accelerator=args.accelerator,
     devices=args.devices,
     max_epochs=args.max_epochs if args.max_epochs > 0 else None,
     default_root_dir=args.default_root_dir,
-    callbacks=[checkpoint_callback],
+    callbacks=callbacks,
     logger=tb_logger,
     num_sanity_val_steps=0,  # Skip sanity check to avoid issues
   )
