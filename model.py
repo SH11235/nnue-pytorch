@@ -235,10 +235,17 @@ class NNUE(pl.LightningModule):
       if self.trainer.global_step - self.warmup_start_global_step < self.num_batches_warmup:
         warmup_scale = min(1.0, float(self.trainer.global_step - self.warmup_start_global_step + 1) / self.num_batches_warmup)
 
-      # スケジューラが設定したLRにwarmup係数を掛ける
+      # base_lrsからLRを計算（scheduler.get_last_lr()は使わない）
+      # 理由: pg["lr"]を直接変更するとget_last_lr()に影響を与えてしまうため
       scheduler = self.lr_schedulers()
       if scheduler is not None:
-        scheduled_lr = scheduler.get_last_lr()[0]
+        base_lr = scheduler.base_lrs[0]
+        # milestone係数を自分で計算
+        milestone_factor = 1.0
+        for milestone in sorted(self.lr_milestones):
+          if self.current_epoch >= milestone:
+            milestone_factor *= self.lr_gamma
+        scheduled_lr = base_lr * milestone_factor
       else:
         scheduled_lr = self.lr[0]
 
